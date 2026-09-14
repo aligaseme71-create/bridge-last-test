@@ -1,0 +1,49 @@
+name: Build Bridge APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Bridge
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android build tools
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Download libv2ray AAR
+        run: |
+          mkdir -p app/libs
+          curl -fL --retry 3 -o app/libs/libv2ray.aar \
+            https://github.com/2dust/AndroidLibXrayLite/releases/download/v26.6.27/libv2ray.aar
+          ls -la app/libs/libv2ray.aar
+          file app/libs/libv2ray.aar
+          test "$(head -c 2 app/libs/libv2ray.aar)" = "PK" && echo "OK: valid AAR" || { echo "ERROR: downloaded file is not a valid AAR"; exit 1; }
+
+      - name: Build Debug APK
+        run: gradle assembleDebug --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridge-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
