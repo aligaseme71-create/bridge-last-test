@@ -5,350 +5,278 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
-import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.app.NotificationCompat
-import go.Seq
-import libv2ray.CoreCallbackHandler
-import libv2ray.CoreController
-import libv2ray.Libv2ray
+import java.io.IOException
+import java.net.HttpURLConnection
+import java.net.URL
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 class BridgeVpnService : VpnService() {
 
-    companion object {
-        const val ACTION_CONNECT = "com.bridge.app.CONNECT"
-        const val ACTION_DISCONNECT = "com.bridge.app.DISCONNECT"
-        const val EXTRA_URI = "uri"
-
-        private const val CHANNEL_ID = "bridge_vpn"
-        private const val NOTIFICATION_ID = 1001
-        private const val TAG = "BRIDGE_VPN"
-
-        // افزایش تایم‌اوت: شبکه‌های محدود گاهی تا ۳۰ ثانیه لازم دارند
-        private const val VERIFY_TIMEOUT_MS = 35_000L
-
-        // چند probe به ترتیب امتحان می‌شود؛ gstatic در ایران معمولاً بلاک است
-        private val PROBE_URLS = listOf(
-            "http://cp.cloudflare.com/generate_204",
-            "http://connectivitycheck.gstatic.com/generate_204",
-            "https://www.gstatic.com/generate_204"
-        )
-    }
-
-    private val coreLog = ArrayDeque<String>()
+    private val worker: ScheduledExecutorService = Executors.newScheduledThreadPool(2)
+    private val handler = android.os.Handler(android.os.Looper.getMainLooper())
     private val xrayRunning = AtomicBoolean(false)
-    private val tunFdClosed = AtomicBoolean(false)
-    private val worker = Executors.newSingleThreadExecutor()
+    private var stopping = false
 
-    private var core: CoreController? = null
-    private var tunFd: ParcelFileDescriptor? = null
+    private var vpnInterface: ParcelFileDescriptor? = null
+    private var controller: XrayController? = null
 
-    // ---------------------------------------------------------------- core log
+    companion object {
+        private const val CHANNEL_ID = "BridgeVpnChannel"
+        private const val NOTIFICATION_ID = 1
 
-    private fun appendCoreLog(line: String) {
-        synchronized(coreLog) {
-            coreLog.addLast(line)
-            while (coreLog.size > 20) coreLog.removeFirst()
-        }
-        Log.d(TAG, "core | $line")
+        // Changed probe URLs to avoid blocked domains
+        private val PROBE_URLS = listOf(
+            "http://cp.cloudflare.com/generate_204"
+        )
+        
+        // Increased timeout for slower connections
+        private const val VERIFY_TIMEOUT_MS = 35_000
     }
 
-    private fun lastCoreLog(): String = synchronized(coreLog) {
-        coreLog.toList().takeLast(5).joinToString(" | ").ifBlank { "no core log" }
+    override fun onCreate() {
+        super.onCreate()
+        createNotificationChannel()
+        Log.i("BRIDGE_VPN", "Service created")
     }
-
-    // --------------------------------------------------------------- callbacks
-
-    private val callback = object : CoreCallbackHandler {
-        // شروع هسته را اینجا CONNECTED علامت نمی‌زنیم؛ اعتبارسنجی جدا انجام می‌شود
-        override fun startup(): Long {
-            appendCoreLog("startup callback")
-            return 0L
-        }
-
-        override fun shutdown(): Long {
-            appendCoreLog("shutdown callback")
-            xrayRunning.set(false)
-            return 0L
-        }
-
-        override fun onEmitStatus(code: Long, msg: String?): Long {
-            appendCoreLog("status $code: ${msg ?: "-"}")
-            return 0L
-        }
-    }
-
-    // -------------------------------------------------------------- lifecycle
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_DISCONNECT -> stopTunnel()
-            ACTION_CONNECT -> {
-                val uri = intent.getStringExtra(EXTRA_URI)
-                if (uri.isNullOrBlank()) {
-                    setError("Empty server URI")
-                } else {
-                    worker.execute { startTunnel(uri) }
-                }
-            }
-            else -> Log.w(TAG, "unknown action: ${intent?.action}")
+        Log.i("BRIDGE_VPN", "onStartCommand received")
+        
+        if (intent?.action == "STOP") {
+            stopVpn()
+            return START_NOT_STICKY
         }
+
+        val uri = intent?.getStringExtra("uri") ?: run {
+            setError("No server URI provided")
+            return START_NOT_STICKY
+        }
+
+        startForeground(NOTIFICATION_ID, buildNotification("Starting..."))
+        startVpn(uri)
+        
         return START_STICKY
     }
 
-    override fun onRevoke() {
-        appendCoreLog("onRevoke")
-        stopTunnel()
-        super.onRevoke()
-    }
+    private fun startVpn(uri: String) {
+        Log.i("BRIDGE_VPN", "Starting VPN with URI")
+        
+        stopping = false
+        BridgeVpnState.stage = BridgeVpnState.Stage.CONNECTING
+        broadcastState()
 
-    override fun onDestroy() {
-        stopTunnel(stopService = false, quiet = true)
-        worker.shutdownNow()
-        super.onDestroy()
-    }
-
-    // ------------------------------------------------------------------- core
-
-    private fun initializeCore(): CoreController {
-        core?.let { return it }
-        Seq.setContext(applicationContext)
-        Libv2ray.initCoreEnv(filesDir.absolutePath, "")
-        val c = Libv2ray.newCoreController(callback)
-        core = c
-        return c
-    }
-
-    private fun startTunnel(uri: String) {
         try {
-            stopTunnel(stopService = false, quiet = true)
-            val c = initializeCore()
-
-            setStage(BridgeVpnState.Stage.CONNECTING, "Connecting…")
-            startBridgeForeground("Bridge connecting…")
-
-            val config = try {
-                XrayConfigBuilder.buildTunnel(uri)
-            } catch (t: Throwable) {
-                setError("Bad config: ${t.message}")
-                return
-            }
-            Log.d(TAG, "config = $config")
-
             val builder = Builder()
-                .setSession("Bridge")
-                .setMtu(1500)
-                .addAddress("10.0.0.2", 30)
+                .setSession("BridgeVPN")
+                .addAddress("10.233.233.1", 24)
                 .addRoute("0.0.0.0", 0)
-                .addRoute("::", 0)
                 .addDnsServer("1.1.1.1")
                 .addDnsServer("8.8.8.8")
+                .setMtu(1500)
+                .setBlocking(false)
+
+            vpnInterface = builder.establish()
+            if (vpnInterface == null) {
+                setError("Failed to establish VPN interface")
+                return
+            }
+
+            controller = XrayController(this)
+            startXrayLoop(uri)
+            scheduleConnectionVerifier()
+
+        } catch (e: Exception) {
+            Log.e("BRIDGE_VPN", "Failed to start VPN", e)
+            setError("Startup failed: ${e.message}")
+        }
+    }
+
+    private fun startXrayLoop(uri: String) {
+        worker.execute {
+            val pfdLocal = vpnInterface ?: run {
+                handler.post { setError("tunFd is null before startLoop") }
+                return@execute
+            }
+            val coreLocal = controller ?: run {
+                handler.post { setError("core is null before startLoop") }
+                return@execute
+            }
+            val configLocal = try {
+                XrayConfigBuilder.buildTunnel(uri)
+            } catch (t: Throwable) {
+                handler.post { setError("Config build failed: ${t.message}") }
+                return@execute
+            }
+
+            val fd = pfdLocal.fd
+            Log.i("BRIDGE_LOOP", "fd=$fd valid=${fd > 0}")
+            Log.i("BRIDGE_LOOP", "config_len=${configLocal.length}")
+            
             try {
-                builder.addDisallowedApplication(packageName)
-            } catch (_: Throwable) {
+                xrayRunning.set(true)
+                Log.i("BRIDGE_LOOP", "calling startLoop...")
+                coreLocal.startLoop(configLocal, fd)
+                Log.i("BRIDGE_LOOP", "startLoop returned (core exited)")
+            } catch (t: Throwable) {
+                Log.e("BRIDGE_LOOP", "startLoop threw: ${t.javaClass.simpleName}: ${t.message}")
+            } finally {
+                xrayRunning.set(false)
+                if (!stopping) closeTunFd()
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) builder.setMetered(false)
-
-            val fd = builder.establish()
-            if (fd == null) {
-                setError("Could not establish VPN interface")
-                return
+            
+            if (!stopping && BridgeVpnState.stage != BridgeVpnState.Stage.CONNECTED) {
+                handler.post { setError("Core exited immediately | ${lastCoreLog()}") }
             }
-            tunFd = fd
-            tunFdClosed.set(false)
+        }
+    }
 
-            Thread({
+    private fun scheduleConnectionVerifier() {
+        worker.schedule({
+            if (xrayRunning.get() && !stopping) {
+                verifyConnection()
+            }
+        }, 3, TimeUnit.SECONDS)
+    }
+
+    private fun verifyConnection() {
+        Log.i("BRIDGE_VPN", "Verifying connection")
+        
+        worker.execute {
+            val reachable = PROBE_URLS.any { probeUrl ->
                 try {
-                    xrayRunning.set(true)
-                    c.startLoop(config, fd.fd)
-                    appendCoreLog("startLoop returned")
-                } catch (t: Throwable) {
-                    appendCoreLog("startLoop error: ${t.message}")
-                } finally {
-                    xrayRunning.set(false)
-                    closeTunFd()
+                    val conn = URL(probeUrl).openConnection() as HttpURLConnection
+                    conn.connectTimeout = VERIFY_TIMEOUT_MS
+                    conn.readTimeout = VERIFY_TIMEOUT_MS
+                    conn.instanceFollowRedirects = false
+                    conn.requestMethod = "GET"
+                    val code = conn.responseCode
+                    conn.disconnect()
+                    Log.i("BRIDGE_VPN", "Probe $probeUrl returned $code")
+                    code in 200..299 || code == 204
+                } catch (e: IOException) {
+                    Log.w("BRIDGE_VPN", "Probe $probeUrl failed: ${e.message}")
+                    false
                 }
-            }, "xray-loop").start()
-
-            // انتظار تا ۳ ثانیه برای بالا آمدن هسته
-            var waited = 0
-            while (!xrayRunning.get() && waited < 3000) {
-                Thread.sleep(100)
-                waited += 100
             }
-            if (!xrayRunning.get()) {
-                setError("Core did not start | ${lastCoreLog()}")
-                return
-            }
-            Thread.sleep(2500) // warm-up
 
-            verifyConnection(c) { xrayRunning.get() }
-        } catch (t: Throwable) {
-            setError("${t.message} | ${lastCoreLog()}")
+            handler.post {
+                when {
+                    reachable -> {
+                        Log.i("BRIDGE_VPN", "Connection verified")
+                        BridgeVpnState.stage = BridgeVpnState.Stage.CONNECTED
+                        updateNotification("Connected")
+                        broadcastState()
+                    }
+                    xrayRunning.get() -> {
+                        Log.w("BRIDGE_VPN", "Probe failed but core alive - marking connected (unverified)")
+                        BridgeVpnState.stage = BridgeVpnState.Stage.CONNECTED
+                        updateNotification("Connected (unverified)")
+                        broadcastState()
+                    }
+                    else -> {
+                        Log.e("BRIDGE_VPN", "Connection dead")
+                        setError("Connection verification failed")
+                    }
+                }
+            }
         }
     }
 
-    /**
-     * اگر probe جواب داد ⇒ CONNECTED با پینگ.
-     * اگر probe جواب نداد ولی هسته زنده است ⇒ CONNECTED (unverified) به جای ERROR،
-     * چون در شبکه‌های فیلترشده خودِ probe ممکن است بلاک باشد.
-     */
-    private fun verifyConnection(c: CoreController, isRunning: () -> Boolean = { true }) {
-        val deadline = System.currentTimeMillis() + VERIFY_TIMEOUT_MS
-
-        while (System.currentTimeMillis() < deadline) {
-            if (!isRunning()) {
-                setError("Core stopped | ${lastCoreLog()}")
-                return
-            }
-            for (url in PROBE_URLS) {
-                val delay = try {
-                    c.measureDelay(url)
-                } catch (t: Throwable) {
-                    appendCoreLog("probe $url failed: ${t.message}")
-                    -1L
-                }
-                if (delay in 1..12_000) {
-                    BridgeVpnState.latencyMs = delay
-                    setStage(BridgeVpnState.Stage.CONNECTED, "Connected")
-                    updateNotification("Bridge connected • $delay ms")
-                    return
-                }
-            }
-            Thread.sleep(2000)
-        }
-
-        if (isRunning()) {
-            BridgeVpnState.latencyMs = -1L
-            setStage(BridgeVpnState.Stage.CONNECTED, "Connected (unverified)")
-            updateNotification("Bridge connected • probe blocked")
-            appendCoreLog("probe failed, keeping tunnel (unverified)")
-        } else {
-            setError("VPN started but proxy traffic failed | ${lastCoreLog()}")
-        }
-    }
-
-    // ------------------------------------------------------------------ state
-
-    private fun setStage(stage: BridgeVpnState.Stage, message: String) {
-        BridgeVpnState.stage = stage
-        BridgeVpnState.message = message
-    }
-
-    private fun setError(text: String) {
-        Log.e(TAG, "error: $text")
-        BridgeVpnState.stage = BridgeVpnState.Stage.ERROR
-        BridgeVpnState.message = text
-        BridgeVpnState.latencyMs = -1L
-        try {
-            if (xrayRunning.get()) core?.stopLoop()
-        } catch (_: Throwable) {
-        }
+    private fun stopVpn() {
+        Log.i("BRIDGE_VPN", "Stopping VPN")
+        stopping = true
+        xrayRunning.set(false)
+        
+        controller?.stopLoop()
+        controller = null
+        
         closeTunFd()
-        Thread {
-            Thread.sleep(1500)
-            BridgeVpnState.reset()
-        }.start()
-        stopForegroundCompat()
+        
+        BridgeVpnState.stage = BridgeVpnState.Stage.DISCONNECTED
+        broadcastState()
+        
+        stopForeground(true)
         stopSelf()
     }
 
-    private fun stopTunnel(stopService: Boolean = true, quiet: Boolean = false) {
-        if (!quiet) setStage(BridgeVpnState.Stage.DISCONNECTING, "Disconnecting…")
-        try {
-            core?.stopLoop()
-        } catch (t: Throwable) {
-            appendCoreLog("stopLoop error: ${t.message}")
-        }
-        xrayRunning.set(false)
-        closeTunFd()
-        if (!quiet) BridgeVpnState.reset()
-        if (stopService) {
-            stopForegroundCompat()
-            stopSelf()
-        }
-    }
-
     private fun closeTunFd() {
-        if (tunFdClosed.compareAndSet(false, true)) {
+        vpnInterface?.let {
             try {
-                tunFd?.close()
-            } catch (_: Throwable) {
+                it.close()
+                Log.i("BRIDGE_VPN", "TUN fd closed")
+            } catch (e: Exception) {
+                Log.w("BRIDGE_VPN", "Error closing TUN fd", e)
             }
-            tunFd = null
         }
+        vpnInterface = null
     }
 
-    // ----------------------------------------------------------- notification
-
-    private fun startBridgeForeground(text: String) {
-        ensureChannel()
-        val notification = buildNotification(text)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-            )
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
-        }
+    private fun setError(message: String) {
+        Log.e("BRIDGE_VPN", "Error: $message")
+        BridgeVpnState.stage = BridgeVpnState.Stage.ERROR
+        BridgeVpnState.errorMessage = message
+        updateNotification("Error: $message")
+        broadcastState()
+        stopVpn()
     }
 
-    private fun ensureChannel() {
+    private fun lastCoreLog(): String {
+        return controller?.getLastLog() ?: "no log"
+    }
+
+    private fun broadcastState() {
+        sendBroadcast(Intent("com.bridge.app.VPN_STATE_CHANGED"))
+    }
+
+    private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "VPN Service",
+                NotificationManager.IMPORTANCE_LOW
+            )
             val nm = getSystemService(NotificationManager::class.java)
-            if (nm.getNotificationChannel(CHANNEL_ID) == null) {
-                nm.createNotificationChannel(
-                    NotificationChannel(
-                        CHANNEL_ID,
-                        "Bridge VPN",
-                        NotificationManager.IMPORTANCE_LOW
-                    )
-                )
-            }
+            nm?.createNotificationChannel(channel)
         }
     }
 
-    private fun buildNotification(text: String): Notification {
-        val pi = PendingIntent.getActivity(
-            this, 0,
-            Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+    private fun buildNotification(status: String): Notification {
+        val intent = Intent(this, MainActivity::class.java)
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            0,
+            intent,
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) 
+                PendingIntent.FLAG_IMMUTABLE 
+            else 
+                0
         )
+
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_sys_warning)
-            .setContentTitle("Bridge")
-            .setContentText(text)
-            .setOngoing(true)
-            .setOnlyAlertOnce(true)
-            .setContentIntent(pi)
+            .setContentTitle("Bridge VPN")
+            .setContentText(status)
+            .setSmallIcon(R.drawable.ic_bridge_launcher)
+            .setContentIntent(pendingIntent)
             .build()
     }
 
-    private fun updateNotification(text: String) {
-        try {
-            ensureChannel()
-            getSystemService(NotificationManager::class.java)
-                .notify(NOTIFICATION_ID, buildNotification(text))
-        } catch (_: Throwable) {
-        }
+    private fun updateNotification(status: String) {
+        val nm = getSystemService(NotificationManager::class.java)
+        nm?.notify(NOTIFICATION_ID, buildNotification(status))
     }
 
-    private fun stopForegroundCompat() {
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                stopForeground(STOP_FOREGROUND_REMOVE)
-            } else {
-                @Suppress("DEPRECATION")
-                stopForeground(true)
-            }
-        } catch (_: Throwable) {
-        }
+    override fun onDestroy() {
+        super.onDestroy()
+        stopVpn()
+        worker.shutdownNow()
+        Log.i("BRIDGE_VPN", "Service destroyed")
     }
 }
